@@ -9,37 +9,56 @@ const connectDB = require('./config/db');
 
 const app = express();
 
-// CORS Configuration
+// ==========================================
+// 1. CORS CONFIGURATION
+// ==========================================
+
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
+  'https://lostfound-frontend-liard.vercel.app',
   process.env.CLIENT_URL
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
+    console.log('Incoming Origin:', origin);
+
+    // Allow requests without origin (Postman, server-to-server)
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    return callback(new Error(`CORS blocked origin: ${origin}`));
+    console.error('Blocked CORS Origin:', origin);
+
+    return callback(new Error('Not allowed by CORS'));
   },
   credentials: true
 }));
 
-// Body Parsers
-app.use(express.json({ limit: '10mb' }));
+// ==========================================
+// 2. BODY PARSERS
+// ==========================================
+
+app.use(express.json({
+  limit: '10mb'
+}));
+
 app.use(express.urlencoded({
   extended: true,
   limit: '10mb'
 }));
 
-// Database Connection Middleware
-// Every API request waits for MongoDB connection.
+// ==========================================
+// 3. DATABASE CONNECTION MIDDLEWARE
+// ==========================================
+
 app.use(async (req, res, next) => {
   try {
     await connectDB();
+
     next();
+
   } catch (error) {
     console.error('Database Connection Failed:', error);
 
@@ -51,21 +70,41 @@ app.use(async (req, res, next) => {
   }
 });
 
-// API Routes
-app.use('/api/auth', require('./routes/authRoutes'));
-app.use('/api/items', require('./routes/itemRoutes'));
-app.use('/api/claims', require('./routes/claimRoutes'));
-app.use('/api/ai', require('./routes/aiRoutes'));
+// ==========================================
+// 4. HEALTH CHECK ROUTE
+// ==========================================
 
-// Health Check
 app.get('/', (req, res) => {
-  res.status(200).json({
+  return res.status(200).json({
     success: true,
     message: 'Lost & Found Engine Running Smoothly 🚀'
   });
 });
 
-// Global Error Handler
+// ==========================================
+// 5. API ROUTES
+// ==========================================
+
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/items', require('./routes/itemRoutes'));
+app.use('/api/claims', require('./routes/claimRoutes'));
+app.use('/api/ai', require('./routes/aiRoutes'));
+
+// ==========================================
+// 6. NOT FOUND HANDLER
+// ==========================================
+
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    message: 'API route not found'
+  });
+});
+
+// ==========================================
+// 7. GLOBAL ERROR HANDLER
+// ==========================================
+
 app.use((err, req, res, next) => {
   console.error('Global Server Error:', err);
 
@@ -73,13 +112,16 @@ app.use((err, req, res, next) => {
     return next(err);
   }
 
-  res.status(500).json({
+  return res.status(500).json({
     success: false,
     message: err.message || 'Internal Server Error'
   });
 });
 
-// Local Development Server
+// ==========================================
+// 8. LOCAL DEVELOPMENT SERVER
+// ==========================================
+
 if (!process.env.VERCEL) {
   const PORT = process.env.PORT || 5000;
 
@@ -88,5 +130,8 @@ if (!process.env.VERCEL) {
   });
 }
 
-// Vercel Export
+// ==========================================
+// 9. VERCEL SERVERLESS EXPORT
+// ==========================================
+
 module.exports = app;
