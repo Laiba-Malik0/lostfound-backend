@@ -6,40 +6,38 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 // Recommended active models priority list
 const MODEL_PRIORITY = [
   "gemini-3.8-flash",
-  "gemini-3.5-flash-lite"
+  "gemini-1.5-flash"
 ];
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Local Fallback Matcher
+// Local fallback matcher. Candidate records are always supplied by the
+// database query, which already restricts them to the opposite item type.
 const getKeywordMatches = (currentItem, candidateItems) => {
+  const targetText = `${currentItem.title || ""} ${currentItem.description || ""} ${currentItem.location || ""}`.toLowerCase();
+  const targetWords = [...new Set(targetText.split(/\s+/).filter((word) => word.length > 3))];
+
   return candidateItems
     .map((candidate) => {
+      const candidateText = `${candidate.title || ""} ${candidate.description || ""} ${candidate.location || ""}`.toLowerCase();
       let score = 0;
-      const targetText = `${currentItem.title} ${currentItem.description} ${currentItem.location}`.toLowerCase();
-      const candText = `${candidate.title} ${candidate.description} ${candidate.location}`.toLowerCase();
 
-      if (currentItem.category.toLowerCase() === candidate.category.toLowerCase()) {
+      if ((currentItem.category || "").toLowerCase() === (candidate.category || "").toLowerCase()) {
         score += 40;
       }
 
-      const targetWords = targetText.split(/\s+/).filter((w) => w.length > 3);
-      let matchedWords = 0;
-      targetWords.forEach((word) => {
-        if (candText.includes(word)) matchedWords++;
-      });
-
-      if (targetWords.length > 0) {
-        score += Math.min(50, Math.round((matchedWords / targetWords.length) * 60));
+      const matchedWords = targetWords.filter((word) => candidateText.includes(word)).length;
+      if (targetWords.length) {
+        score += Math.min(60, Math.round((matchedWords / targetWords.length) * 60));
       }
 
       return {
         candidateId: candidate._id.toString(),
-        matchScore: score,
-        reason: `Matched based on category (${candidate.category}) and location keywords.`,
+        matchScore: Math.min(100, score),
+        reason: `Matched using item category, description and location details.`,
       };
     })
-    .filter((m) => m.matchScore >= 40)
+    .filter((match) => match.matchScore >= 40)
     .sort((a, b) => b.matchScore - a.matchScore);
 };
 
@@ -52,100 +50,156 @@ const matchItemWithAI = async (req, res) => {
       return res.status(400).json({ message: "Item ID is required" });
     }
 
+    if (!require("mongoose").isValidObjectId(itemId)) {
+      return res.status(400).json({ message: "Invalid item ID" });
+    }
+
     const currentItem = await Item.findById(itemId);
     if (!currentItem) {
       return res.status(404).json({ message: "Item not found in database" });
     }
 
     const oppositeType = currentItem.type === "lost" ? "found" : "lost";
+    const requesterId = req.user?._id;
 
-    let candidateItems = await Item.find({
+    // Only open records of the opposite type can be matches.
+    // Exclude the logged-in user's own records so the UI cannot offer
+    // a claim request against an item they own.
+    const candidateItems = await Item.find({
       type: oppositeType,
-      category: currentItem.category,
-    }).limit(15);
+      status: "open",
+      ...(requesterId ? { user: { $ne: requesterId } } : {}),
+    })
+      .populate("user", "name email phone")
+      .sort({ createdAt: -1 })
+      .limit(30);
 
-    if (candidateItems.length < 5) {
-      const extraItems = await Item.find({
-        type: oppositeType,
-        _id: { $nin: candidateItems.map((i) => i._id) },
-      }).limit(15 - candidateItems.length);
-      candidateItems = candidateItems.concat(extraItems);
-    }
-
-    if (!candidateItems || candidateItems.length === 0) {
+    if (!candidateItems.length) {
       return res.status(200).json({
         success: true,
         currentItemId: currentItem._id,
+        currentItemType: currentItem.type,
+        expectedMatchType: oppositeType,
         matches: [],
-        message: `No ${oppositeType} items available in database to compare`,
+        message: `No open ${oppositeType} items are available to compare.`,
       });
     }
 
+    const candidatePayload = candidateItems.map((candidate) => ({
+      candidateId: candidate._id.toString(),
+      title: candidate.title,
+      category: candidate.category,
+      location: candidate.location,
+      description: candidate.description,
+    }));
+
     const prompt = `
       You are an AI Lost & Found Matchmaker.
-      Compare TARGET ITEM with CANDIDATE ITEMS and calculate match score (0 to 100%) for each.
+      Compare the TARGET ITEM with the CANDIDATE ITEMS.
+      Return only genuine possible matches with matchScore from 50 to 100.
+      You MUST only use candidateId values supplied in the candidate list.
 
       TARGET ITEM:
-      - Title: ${currentItem.title}
-      - Category: ${currentItem.category}
-      - Location: ${currentItem.location}
-      - Description: ${currentItem.description}
+      ${JSON.stringify({
+        title: currentItem.title,
+        category: currentItem.category,
+        location: currentItem.location,
+        description: currentItem.description,
+        type: currentItem.type,
+      })}
 
       CANDIDATE ITEMS:
-      ${JSON.stringify(
-        candidateItems.map((item) => ({
-          candidateId: item._id.toString(),
-          title: item.title,
-          category: item.category,
-          location: item.location,
-          description: item.description,
-        }))
-      )}
+      ${JSON.stringify(candidatePayload)}
 
-      Only return candidates with matchScore >= 50%.
-      Return RAW JSON ARRAY containing objects with keys: candidateId, matchScore, reason. Do not wrap in markdown code blocks.
+      Return a raw JSON array. Each object must contain candidateId, matchScore,
+      and reason. Do not include markdown or any text outside the JSON array.
     `;
 
     let rawText = null;
 
-    for (const modelName of MODEL_PRIORITY) {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          console.log(`🤖 Attempting AI matching with model: ${modelName} (Attempt ${attempt})`);
-          const model = genAI.getGenerativeModel({ model: modelName });
-          const result = await model.generateContent(prompt);
-          rawText = result.response.text().trim();
-          if (rawText) break;
-        } catch (err) {
-          console.warn(`⚠️ Model ${modelName} attempt ${attempt} failed: ${err.message}`);
-          await delay(1000);
+    if (process.env.GEMINI_API_KEY) {
+      for (const modelName of MODEL_PRIORITY) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            console.log(`AI matching with ${modelName} (attempt ${attempt})`);
+            const model = genAI.getGenerativeModel({ model: modelName });
+            const result = await model.generateContent(prompt);
+            rawText = result.response.text().trim();
+            if (rawText) break;
+          } catch (err) {
+            console.warn(`AI model ${modelName} attempt ${attempt} failed: ${err.message}`);
+            await delay(800);
+          }
         }
+        if (rawText) break;
       }
-      if (rawText) break;
     }
 
-    let matches = [];
-
+    let scoredMatches = [];
     if (rawText) {
-      rawText = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
       try {
-        matches = JSON.parse(rawText);
+        const cleaned = rawText.replace(/```json/gi, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(cleaned);
+        if (Array.isArray(parsed)) {
+          const allowedIds = new Set(candidateItems.map((candidate) => candidate._id.toString()));
+          scoredMatches = parsed
+            .filter((match) => match && allowedIds.has(String(match.candidateId)))
+            .map((match) => ({
+              candidateId: String(match.candidateId),
+              matchScore: Math.max(0, Math.min(100, Number(match.matchScore) || 0)),
+              reason: String(match.reason || "Potential match based on item details."),
+            }))
+            .filter((match) => match.matchScore >= 50);
+        } else {
+          scoredMatches = getKeywordMatches(currentItem, candidateItems);
+        }
       } catch (parseError) {
-        console.error("❌ JSON Parse Error, using local fallback matcher.");
-        matches = getKeywordMatches(currentItem, candidateItems);
+        console.error("AI response JSON parsing failed; using local matching.", parseError.message);
+        scoredMatches = getKeywordMatches(currentItem, candidateItems);
       }
     } else {
-      console.warn("⚠️ AI Service unavailable. Serving local heuristic matches.");
-      matches = getKeywordMatches(currentItem, candidateItems);
+      scoredMatches = getKeywordMatches(currentItem, candidateItems);
     }
+
+    // Attach the exact database record to every score. The frontend must use
+    // this _id for claims; it must never search by title to guess an ID.
+    const candidateById = new Map(
+      candidateItems.map((candidate) => [candidate._id.toString(), candidate])
+    );
+
+    const matches = scoredMatches
+      .map((match) => {
+        const candidate = candidateById.get(match.candidateId);
+        if (!candidate || candidate.type !== oppositeType || candidate.status !== "open") return null;
+        return {
+          candidateId: candidate._id.toString(),
+          matchScore: match.matchScore,
+          reason: match.reason,
+          _id: candidate._id,
+          title: candidate.title,
+          description: candidate.description,
+          category: candidate.category,
+          location: candidate.location,
+          type: candidate.type,
+          imageUrl: candidate.imageUrl,
+          image: candidate.imageUrl,
+          date: candidate.date,
+          status: candidate.status,
+          user: candidate.user,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.matchScore - a.matchScore);
 
     return res.status(200).json({
       success: true,
       currentItemId: currentItem._id,
+      currentItemType: currentItem.type,
+      expectedMatchType: oppositeType,
       matches,
     });
   } catch (error) {
-    console.error("❌ BACKEND AI CONTROLLER ERROR:", error.stack || error.message || error);
+    console.error("BACKEND AI CONTROLLER ERROR:", error.stack || error.message || error);
     return res.status(500).json({
       message: error.message || "Error processing AI match",
     });
@@ -203,7 +257,7 @@ const analyzeImageWithAI = async (req, res) => {
         analysis: {
           title: "",
           category: "Others",
-          description: "Image uploaded successfully. Please add item details."
+          description: "Image uploaded. Please add item details."
         }
       });
     }
