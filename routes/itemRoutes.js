@@ -1,4 +1,3 @@
-
 const express = require('express');
 const mongoose = require('mongoose');
 
@@ -10,13 +9,21 @@ const upload = require('../config/cloudinary');
 
 // Image Upload Handler
 const handleUpload = (req, res, next) => {
+  if (!upload.isConfigured) {
+    return res.status(503).json({
+      message: 'Image upload service is not configured on the server.'
+    });
+  }
+
   upload.single('image')(req, res, (err) => {
     if (err) {
       console.error('Cloudinary Upload Error:', err);
 
-      return res.status(400).json({
-        message: 'Image upload failed',
-        error: err.message
+      const statusCode =
+        err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+
+      return res.status(statusCode).json({
+        message: err.message || 'Image upload failed'
       });
     }
 

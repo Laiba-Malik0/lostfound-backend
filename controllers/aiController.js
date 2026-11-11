@@ -1,24 +1,78 @@
-
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const mongoose = require("mongoose");
 const Item = require("../models/Item");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const AI_TIMEOUT = Number(process.env.AI_TIMEOUT_MS) || 7500;
 
-const MODEL_NAME = "gemini-3.8-flash";
-const AI_TIMEOUT = 8000;
+// Reuse one SDK client per serverless instance.
+const genAI = GEMINI_API_KEY
+  ? new GoogleGenerativeAI(GEMINI_API_KEY)
+  : null;
 
-// Prevent slow AI requests from blocking the API response.
-const withTimeout = (promise, ms = AI_TIMEOUT) => {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("AI request timeout")), ms);
-    }),
-  ]);
-};
+// A small per-instance queue prevents a burst of requests from sending
+// unlimited simultaneous calls to Gemini. Requests outside the queue fall
+// back to the existing local matching / empty scanner response.
+const MAX_CONCURRENT_AI_REQUESTS = Number(process.env.AI_MAX_CONCURRENCY) || 4;
+const MAX_QUEUED_AI_REQUESTS = Number(process.env.AI_MAX_QUEUE) || 16;
+const AI_QUEUE_WAIT_MS = Number(process.env.AI_QUEUE_WAIT_MS) || 2000;
 
-// Local matching fallback
+let activeAIRequests = 0;
+const aiRequestQueue = [];
+
+const runAIRequest = (task) =>
+  new Promise((resolve, reject) => {
+    const start = () => {
+      activeAIRequests += 1;
+
+      Promise.resolve()
+        .then(task)
+        .then(resolve, reject)
+        .finally(() => {
+          activeAIRequests = Math.max(0, activeAIRequests - 1);
+
+          const next = aiRequestQueue.shift();
+          if (next) {
+            clearTimeout(next.timer);
+            next.start();
+          }
+        });
+    };
+
+    if (activeAIRequests < MAX_CONCURRENT_AI_REQUESTS) {
+      start();
+      return;
+    }
+
+    if (aiRequestQueue.length >= MAX_QUEUED_AI_REQUESTS) {
+      const error = new Error("AI service is busy. Please try again shortly.");
+      error.code = "AI_QUEUE_FULL";
+      reject(error);
+      return;
+    }
+
+    const queuedTask = {
+      start,
+      timer: null,
+    };
+
+    queuedTask.timer = setTimeout(() => {
+      const index = aiRequestQueue.indexOf(queuedTask);
+
+      if (index !== -1) {
+        aiRequestQueue.splice(index, 1);
+        const error = new Error("AI request queue timed out.");
+        error.code = "AI_QUEUE_TIMEOUT";
+        reject(error);
+      }
+    }, AI_QUEUE_WAIT_MS);
+
+    aiRequestQueue.push(queuedTask);
+  });
+
+// Local matching fallback. Scoring and matching rules are intentionally
+// kept the same as the existing implementation.
 const getKeywordMatches = (currentItem, candidateItems) => {
   const normalize = (value) =>
     String(value || "")
@@ -75,14 +129,34 @@ const getKeywordMatches = (currentItem, candidateItems) => {
     .sort((a, b) => b.matchScore - a.matchScore);
 };
 
-// Safe JSON parser
 const parseAIJSON = (text) => {
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("AI returned an empty response.");
+  }
+
   const cleaned = text
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
 
   return JSON.parse(cleaned);
+};
+
+const createGeminiModel = (maxOutputTokens) => {
+  return genAI.getGenerativeModel(
+    {
+      model: MODEL_NAME,
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens,
+        responseMimeType: "application/json",
+      },
+    },
+    {
+      // The SDK applies this timeout to the HTTP request itself.
+      timeout: AI_TIMEOUT,
+    }
+  );
 };
 
 // ========================================
@@ -109,6 +183,7 @@ const matchItemWithAI = async (req, res) => {
       });
     }
 
+    // Existing Lost <-> Found matching rules are unchanged.
     const oppositeType =
       currentItem.type === "lost" ? "found" : "lost";
 
@@ -140,15 +215,10 @@ const matchItemWithAI = async (req, res) => {
       });
     }
 
-    // Local matching runs immediately.
-    let scoredMatches = getKeywordMatches(
-      currentItem,
-      candidateItems
-    );
+    // Local matching is always available, even if Gemini is unavailable.
+    let scoredMatches = getKeywordMatches(currentItem, candidateItems);
 
-    // AI gets ONE attempt. Local results remain available
-    // if Google AI is slow or unavailable.
-    if (process.env.GEMINI_API_KEY) {
+    if (genAI) {
       try {
         const candidatePayload = candidateItems.map((item) => ({
           candidateId: item._id.toString(),
@@ -189,23 +259,12 @@ FORMAT:
 ]
 `;
 
-        const model = genAI.getGenerativeModel({
-          model: MODEL_NAME,
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 1024,
-            responseMimeType: "application/json",
-          },
-        });
-
-        const result = await withTimeout(
-          model.generateContent(prompt),
-          6000
+        const model = createGeminiModel(1024);
+        const result = await runAIRequest(() =>
+          model.generateContent(prompt)
         );
 
-        const parsed = parseAIJSON(
-          result.response.text()
-        );
+        const parsed = parseAIJSON(result.response.text());
 
         if (Array.isArray(parsed)) {
           const allowedIds = new Set(
@@ -224,22 +283,16 @@ FORMAT:
                 0,
                 Math.min(100, Number(item.matchScore) || 0)
               ),
-              reason: String(
-                item.reason || "Potential item match."
-              ),
+              reason: String(item.reason || "Potential item match."),
             }))
             .filter((item) => item.matchScore >= 50);
 
-          // Use AI results when valid.
           if (aiMatches.length) {
             scoredMatches = aiMatches;
           }
         }
       } catch (error) {
-        console.warn(
-          "AI matching fallback:",
-          error.message
-        );
+        console.warn("AI matching fallback:", error.message);
       }
     }
 
@@ -252,9 +305,7 @@ FORMAT:
 
     const matches = scoredMatches
       .map((match) => {
-        const candidate = candidateById.get(
-          match.candidateId
-        );
+        const candidate = candidateById.get(match.candidateId);
 
         if (
           !candidate ||
@@ -307,9 +358,9 @@ FORMAT:
 
 const analyzeImageWithAI = async (req, res) => {
   try {
-    const { imageBase64, mimeType } = req.body;
+    const { imageBase64, mimeType } = req.body || {};
 
-    if (!imageBase64) {
+    if (!imageBase64 || typeof imageBase64 !== "string") {
       return res.status(400).json({
         success: false,
         message: "Image is required.",
@@ -320,8 +371,7 @@ const analyzeImageWithAI = async (req, res) => {
       ? imageBase64.split(",")[1]
       : imageBase64;
 
-    // Prevent oversized requests.
-    if (cleanBase64.length > 8 * 1024 * 1024) {
+    if (!cleanBase64 || cleanBase64.length > 8 * 1024 * 1024) {
       return res.status(413).json({
         success: false,
         message: "Image is too large. Please upload a smaller image.",
@@ -338,16 +388,18 @@ const analyzeImageWithAI = async (req, res) => {
       ? mimeType
       : "image/jpeg";
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(200).json({
-        success: true,
-        fallback: true,
-        analysis: {
-          title: "",
-          category: "Others",
-          description: "",
-        },
-      });
+    const fallbackResponse = {
+      success: true,
+      fallback: true,
+      analysis: {
+        title: "",
+        category: "Others",
+        description: "",
+      },
+    };
+
+    if (!genAI) {
+      return res.status(200).json(fallbackResponse);
     }
 
     const prompt = `
@@ -367,16 +419,8 @@ Rules:
 - Keep description short.
 `;
 
-    const model = genAI.getGenerativeModel({
-      model: MODEL_NAME,
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 256,
-        responseMimeType: "application/json",
-      },
-    });
-
-    const result = await withTimeout(
+    const model = createGeminiModel(256);
+    const result = await runAIRequest(() =>
       model.generateContent([
         prompt,
         {
@@ -385,13 +429,10 @@ Rules:
             mimeType: safeMimeType,
           },
         },
-      ]),
-      8000
+      ])
     );
 
-    const analysis = parseAIJSON(
-      result.response.text()
-    );
+    const analysis = parseAIJSON(result.response.text());
 
     const allowedCategories = [
       "Electronics",
@@ -410,18 +451,12 @@ Rules:
         category: allowedCategories.includes(analysis.category)
           ? analysis.category
           : "Others",
-        description: String(
-          analysis.description || ""
-        ).slice(0, 300),
+        description: String(analysis.description || "").slice(0, 300),
       },
     });
   } catch (error) {
-    console.error(
-      "IMAGE SCAN ERROR:",
-      error.message
-    );
+    console.error("IMAGE SCAN ERROR:", error.message);
 
-    // Fast fallback instead of waiting for another model.
     return res.status(200).json({
       success: true,
       fallback: true,

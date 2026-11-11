@@ -1,74 +1,62 @@
+const mongoose = require("mongoose");
 
-const mongoose = require('mongoose');
+// Reuse one MongoDB connection/promise inside a warm serverless instance.
+// This prevents each incoming request from opening a separate connection.
+const globalCache = global.__lostFoundMongo || {
+  connection: null,
+  promise: null,
+};
 
-let cached = global.mongoose;
-
-if (!cached) {
-  cached = global.mongoose = {
-    conn: null,
-    promise: null
-  };
-}
+global.__lostFoundMongo = globalCache;
 
 const connectDB = async () => {
-  // Already connected
   if (mongoose.connection.readyState === 1) {
     return mongoose.connection;
   }
 
   if (!process.env.MONGO_URI) {
-    throw new Error('MONGO_URI is missing from environment variables');
+    throw new Error("MONGO_URI is missing from environment variables");
   }
 
-  // Reset stale connection cache
-  if (
-    mongoose.connection.readyState === 0 ||
-    mongoose.connection.readyState === 3
-  ) {
-    cached.conn = null;
-    cached.promise = null;
+  if (mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
+    globalCache.connection = null;
+    globalCache.promise = null;
   }
 
-  // Create a new connection only when needed
-  if (!cached.promise) {
-    cached.promise = mongoose.connect(
-      process.env.MONGO_URI,
-      {
-        serverSelectionTimeoutMS: 15000,
-        connectTimeoutMS: 15000,
-        bufferCommands: false
-      }
-    ).then((mongooseInstance) => {
-      console.log(
-        'MongoDB Connected:',
-        mongooseInstance.connection.name
-      );
-
-      return mongooseInstance.connection;
-    }).catch((error) => {
-      cached.conn = null;
-      cached.promise = null;
-
-      console.error('MongoDB Connection Error:', error.message);
-
-      throw error;
-    });
+  if (!globalCache.promise) {
+    globalCache.promise = mongoose
+      .connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 10000,
+        connectTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+        maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE) || 10,
+        minPoolSize: 0,
+        maxIdleTimeMS: 30000,
+        bufferCommands: false,
+      })
+      .then((instance) => {
+        console.log("MongoDB Connected:", instance.connection.name);
+        return instance.connection;
+      })
+      .catch((error) => {
+        globalCache.connection = null;
+        globalCache.promise = null;
+        console.error("MongoDB Connection Error:", error.message);
+        throw error;
+      });
   }
 
   try {
-    cached.conn = await cached.promise;
+    globalCache.connection = await globalCache.promise;
 
-    // Ensure connection is actually ready
     if (mongoose.connection.readyState !== 1) {
-      throw new Error('MongoDB connection is not ready');
+      throw new Error("MongoDB connection is not ready");
     }
 
-    return cached.conn;
-
+    return globalCache.connection;
   } catch (error) {
-    cached.conn = null;
-    cached.promise = null;
-
+    globalCache.connection = null;
+    globalCache.promise = null;
     throw error;
   }
 };
