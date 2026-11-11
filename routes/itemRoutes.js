@@ -1,33 +1,70 @@
+
 const express = require('express');
+const mongoose = require('mongoose');
+
 const router = express.Router();
+
 const Item = require('../models/Item');
 const { protect } = require('../middleware/authMiddleware');
 const upload = require('../config/cloudinary');
 
+// Image Upload Handler
 const handleUpload = (req, res, next) => {
   upload.single('image')(req, res, (err) => {
     if (err) {
-      console.error("Cloudinary Upload Error:", err);
-      return res.status(400).json({ message: "Image upload failed: " + (err.message || "Invalid Image") });
+      console.error('Cloudinary Upload Error:', err);
+
+      return res.status(400).json({
+        message: 'Image upload failed',
+        error: err.message
+      });
     }
+
     next();
   });
 };
 
-// Get All Items
+// GET ALL ITEMS
 router.get('/', async (req, res) => {
   try {
     const { type, category, search, status } = req.query;
-    let query = {};
 
-    if (type) query.type = type;
-    if (category) query.category = category;
-    if (status) query.status = status;
-    if (search) {
+    const query = {};
+
+    if (type) {
+      if (!['lost', 'found'].includes(type)) {
+        return res.status(400).json({
+          message: 'Invalid item type'
+        });
+      }
+
+      query.type = type;
+    }
+
+    if (category) {
+      query.category = category;
+    }
+
+    if (status) {
+      if (!['open', 'resolved'].includes(status)) {
+        return res.status(400).json({
+          message: 'Invalid item status'
+        });
+      }
+
+      query.status = status;
+    }
+
+    if (search && String(search).trim()) {
+      const safeSearch = String(search).trim().replace(
+        /[.*+?^${}()|[\]\\]/g,
+        '\\$&'
+      );
+
       query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { location: { $regex: search, $options: 'i' } }
+        { title: { $regex: safeSearch, $options: 'i' } },
+        { description: { $regex: safeSearch, $options: 'i' } },
+        { location: { $regex: safeSearch, $options: 'i' } }
       ];
     }
 
@@ -35,106 +72,260 @@ router.get('/', async (req, res) => {
       .populate('user', 'name email phone')
       .sort({ createdAt: -1 });
 
-    res.status(200).json(items);
+    return res.status(200).json(items);
+
   } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('GET ALL ITEMS ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to fetch items',
+      error: err.message
+    });
   }
 });
 
-// Get My Posts
+// GET MY POSTS
 router.get('/my-posts', protect, async (req, res) => {
   try {
-    const myItems = await Item.find({ user: req.user._id }).sort({ createdAt: -1 });
-    res.status(200).json(myItems);
+    const myItems = await Item.find({
+      user: req.user._id
+    }).sort({ createdAt: -1 });
+
+    return res.status(200).json(myItems);
+
   } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('GET MY POSTS ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to fetch your posts',
+      error: err.message
+    });
   }
 });
 
-// Get Single Item
+// GET SINGLE ITEM
 router.get('/:id', async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id).populate('user', 'name email phone');
-    if (!item) return res.status(404).json({ message: 'Item not found' });
-    res.status(200).json(item);
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: 'Invalid item ID'
+      });
+    }
+
+    const item = await Item.findById(id)
+      .populate('user', 'name email phone');
+
+    if (!item) {
+      return res.status(404).json({
+        message: 'Item not found'
+      });
+    }
+
+    return res.status(200).json(item);
+
   } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+    console.error('GET SINGLE ITEM ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to fetch item',
+      error: err.message
+    });
   }
 });
 
-// Create Item
+// CREATE ITEM
 router.post('/', protect, handleUpload, async (req, res) => {
   try {
-    const { title, description, category, type, location, contactInfo, imageUrl, date } = req.body;
-
-    if (!title || !description || !category || !type || !location || !contactInfo) {
-      return res.status(400).json({ message: 'Please fill all required fields' });
-    }
-
-    const finalImageUrl = req.file ? req.file.path : (imageUrl || '');
-
-    const newItem = await Item.create({
+    const {
       title,
       description,
       category,
       type,
       location,
       contactInfo,
+      imageUrl,
+      date
+    } = req.body;
+
+    if (
+      !title ||
+      !description ||
+      !category ||
+      !type ||
+      !location ||
+      !contactInfo
+    ) {
+      return res.status(400).json({
+        message: 'Please fill all required fields'
+      });
+    }
+
+    if (!['lost', 'found'].includes(type)) {
+      return res.status(400).json({
+        message: 'Type must be lost or found'
+      });
+    }
+
+    const finalImageUrl = req.file
+      ? req.file.path
+      : (imageUrl || '');
+
+    const newItem = await Item.create({
+      title: String(title).trim(),
+      description: String(description).trim(),
+      category,
+      type,
+      location: String(location).trim(),
+      contactInfo,
       date: date || new Date(),
       imageUrl: finalImageUrl,
       user: req.user._id
     });
 
-    const populatedItem = await Item.findById(newItem._id).populate('user', 'name email phone');
+    const populatedItem = await Item.findById(newItem._id)
+      .populate('user', 'name email phone');
 
-    res.status(201).json(populatedItem);
+    return res.status(201).json(populatedItem);
+
   } catch (err) {
-    console.error("CREATE ITEM DB ERROR:", err);
-    res.status(500).json({ message: 'Failed to create item', error: err.message });
+    console.error('CREATE ITEM ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to create item',
+      error: err.message
+    });
   }
 });
 
-// Update Item
+// UPDATE ITEM
 router.put('/:id', protect, handleUpload, async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id);
-    if (!item) return res.status(404).json({ message: 'Item not found' });
+    const { id } = req.params;
 
-    if (item.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'User not authorized to update this item' });
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: 'Invalid item ID'
+      });
     }
 
-    let updateData = { ...req.body };
+    const item = await Item.findById(id);
+
+    if (!item) {
+      return res.status(404).json({
+        message: 'Item not found'
+      });
+    }
+
+    if (item.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        message: 'User not authorized to update this item'
+      });
+    }
+
+    const allowedFields = [
+      'title',
+      'description',
+      'category',
+      'type',
+      'location',
+      'contactInfo',
+      'status',
+      'date',
+      'imageUrl'
+    ];
+
+    const updateData = {};
+
+    allowedFields.forEach((field) => {
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field];
+      }
+    });
+
     if (req.file) {
       updateData.imageUrl = req.file.path;
     }
 
+    if (
+      updateData.type &&
+      !['lost', 'found'].includes(updateData.type)
+    ) {
+      return res.status(400).json({
+        message: 'Invalid item type'
+      });
+    }
+
+    if (
+      updateData.status &&
+      !['open', 'resolved'].includes(updateData.status)
+    ) {
+      return res.status(400).json({
+        message: 'Invalid item status'
+      });
+    }
+
     const updatedItem = await Item.findByIdAndUpdate(
-      req.params.id, 
-      updateData, 
-      { new: true, runValidators: true }
+      id,
+      updateData,
+      {
+        new: true,
+        runValidators: true
+      }
     ).populate('user', 'name email phone');
 
-    res.status(200).json(updatedItem);
+    return res.status(200).json(updatedItem);
+
   } catch (err) {
-    res.status(400).json({ message: 'Failed to update item', error: err.message });
+    console.error('UPDATE ITEM ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to update item',
+      error: err.message
+    });
   }
 });
 
-// Delete Item
+// DELETE ITEM
 router.delete('/:id', protect, async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id);
-    if (!item) return res.status(404).json({ message: 'Item not found' });
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        message: 'Invalid item ID'
+      });
+    }
+
+    const item = await Item.findById(id);
+
+    if (!item) {
+      return res.status(404).json({
+        message: 'Item not found'
+      });
+    }
 
     if (item.user.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'User not authorized to delete this item' });
+      return res.status(403).json({
+        message: 'User not authorized to delete this item'
+      });
     }
 
     await item.deleteOne();
-    res.status(200).json({ message: 'Item deleted successfully' });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Item deleted successfully'
+    });
+
   } catch (err) {
-    res.status(500).json({ message: 'Failed to delete item', error: err.message });
+    console.error('DELETE ITEM ERROR:', err);
+
+    return res.status(500).json({
+      message: 'Failed to delete item',
+      error: err.message
+    });
   }
 });
 

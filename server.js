@@ -9,9 +9,6 @@ const connectDB = require('./config/db');
 
 const app = express();
 
-// Connect to MongoDB
-connectDB();
-
 // CORS Configuration
 const allowedOrigins = [
   'http://localhost:5173',
@@ -20,17 +17,12 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests without origin (Postman, mobile apps)
-    if (!origin) {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    return callback(new Error('Not allowed by CORS'));
+    return callback(new Error(`CORS blocked origin: ${origin}`));
   },
   credentials: true
 }));
@@ -42,22 +34,47 @@ app.use(express.urlencoded({
   limit: '10mb'
 }));
 
+// Database Connection Middleware
+// Every API request waits for MongoDB connection.
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    console.error('Database Connection Failed:', error);
+
+    return res.status(503).json({
+      success: false,
+      message: 'Database connection failed',
+      error: error.message
+    });
+  }
+});
+
 // API Routes
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/items', require('./routes/itemRoutes'));
 app.use('/api/claims', require('./routes/claimRoutes'));
 app.use('/api/ai', require('./routes/aiRoutes'));
 
-// Health Check Route
+// Health Check
 app.get('/', (req, res) => {
-  res.status(200).send('Lost & Found Engine Running Smoothly 🚀');
+  res.status(200).json({
+    success: true,
+    message: 'Lost & Found Engine Running Smoothly 🚀'
+  });
 });
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  console.error('Global Server Error:', err.message || err);
+  console.error('Global Server Error:', err);
+
+  if (res.headersSent) {
+    return next(err);
+  }
 
   res.status(500).json({
+    success: false,
     message: err.message || 'Internal Server Error'
   });
 });
@@ -71,5 +88,5 @@ if (!process.env.VERCEL) {
   });
 }
 
-// Export for Vercel Serverless
+// Vercel Export
 module.exports = app;
