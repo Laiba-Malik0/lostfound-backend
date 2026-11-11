@@ -11,44 +11,63 @@ if (!cached) {
 }
 
 const connectDB = async () => {
-  if (cached.conn && mongoose.connection.readyState === 1) {
-    return cached.conn;
+  // Already connected
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
   }
 
   if (!process.env.MONGO_URI) {
     throw new Error('MONGO_URI is missing from environment variables');
   }
 
-  if (!cached.promise) {
-    const options = {
-      bufferCommands: false,
-      serverSelectionTimeoutMS: 10000
-    };
+  // Reset stale connection cache
+  if (
+    mongoose.connection.readyState === 0 ||
+    mongoose.connection.readyState === 3
+  ) {
+    cached.conn = null;
+    cached.promise = null;
+  }
 
+  // Create a new connection only when needed
+  if (!cached.promise) {
     cached.promise = mongoose.connect(
       process.env.MONGO_URI,
-      options
+      {
+        serverSelectionTimeoutMS: 15000,
+        connectTimeoutMS: 15000,
+        bufferCommands: false
+      }
     ).then((mongooseInstance) => {
       console.log(
-        `MongoDB Connected: ${mongooseInstance.connection.name}`
+        'MongoDB Connected:',
+        mongooseInstance.connection.name
       );
 
-      return mongooseInstance;
+      return mongooseInstance.connection;
     }).catch((error) => {
-      cached.promise = null;
       cached.conn = null;
+      cached.promise = null;
+
+      console.error('MongoDB Connection Error:', error.message);
+
       throw error;
     });
   }
 
   try {
     cached.conn = await cached.promise;
-    return cached.conn;
-  } catch (error) {
-    cached.promise = null;
-    cached.conn = null;
 
-    console.error('MongoDB Connection Error:', error.message);
+    // Ensure connection is actually ready
+    if (mongoose.connection.readyState !== 1) {
+      throw new Error('MongoDB connection is not ready');
+    }
+
+    return cached.conn;
+
+  } catch (error) {
+    cached.conn = null;
+    cached.promise = null;
 
     throw error;
   }
